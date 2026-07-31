@@ -1,0 +1,1071 @@
+================================================================================
+MCTR 474 - COMPLETE CODE AND IMPLEMENTATION REFERENCE
+Semi-Autonomous Macadamia Nut Harvesting Robot
+Nunro Brenkman 37540505 - NWU Potchefstroom
+Last updated: 11 July 2026
+================================================================================
+
+This document contains all working code and terminal commands for the project,
+organised by system. Each section begins with a plain-English description of
+what the code does, followed by the code itself. This is the single reference
+for implementation, not the handover documents.
+
+
+================================================================================
+PART 1: ESP32 MAIN CONTROLLER
+================================================================================
+
+--------------------------------------------------------------------------------
+OVERVIEW
+--------------------------------------------------------------------------------
+
+The ESP32 is the robot's motion controller. It runs two parallel roles: in
+manual mode it reads the PS5 DualSense controller over Bluetooth and converts
+joystick inputs into motor PWM signals; in autonomous mode it reads bearing
+and distance data arriving over UART from the Raspberry Pi and steers the
+robot toward detected golf balls. Safety is managed through an e-stop system
+that can be triggered by the Triangle button, controller disconnect, Bluetooth
+timeout, or boot. The hardware watchdog ensures the board resets automatically
+if the firmware ever freezes. Status LEDs indicate the current mode and fault
+state at a glance.
+
+--------------------------------------------------------------------------------
+COMPLETE ESP32 FIRMWARE (paste into Arduino IDE as a .ino file)
+--------------------------------------------------------------------------------
+
+#include <Bluepad32.h>
+#include "esp_task_wdt.h"
+
+// ============================================================================
+// SYSTEM CONFIGURATION
+// These constants define all tunable parameters in one place. Change values
+// here rather than hunting through the code.
+// ============================================================================
+
+ControllerPtr myController = nullptr;
+
+enum RobotMode { MODE_MANUAL, MODE_AUTONOMOUS };
+RobotMode currentMode = MODE_MANUAL;
+
+bool eStopActive    = false;
+bool sweeperRunning = false;
+
+unsigned long lastControllerUpdateMs  = 0;
+const unsigned long CONTROLLER_TIMEOUT_MS = 1500;
+
+const int JOYSTICK_DEADZONE = 25;
+const int JOYSTICK_MAX      = 500;
+
+const int PWM_FREQ           = 20000;
+const int PWM_RESOLUTION_BITS = 8;
+const int PWM_MAX            = 255;
+
+// Drive motor pins (BTS7960 dual-PWM scheme: R_PWM=forward, L_PWM=reverse)
+const int LEFT_RPWM_PIN = 4,   LEFT_RPWM_CHANNEL = 0;
+const int LEFT_LPWM_PIN = 25,  LEFT_LPWM_CHANNEL = 1;
+const int RIGHT_RPWM_PIN = 27, RIGHT_RPWM_CHANNEL = 2;
+const int RIGHT_LPWM_PIN = 26, RIGHT_LPWM_CHANNEL = 3;
+
+// Sweeper motor pins (moved from GPIO14/12 due to boot strapping conflicts)
+const int SWEEPER_RPWM_PIN = 19, SWEEPER_RPWM_CHANNEL = 4;
+const int SWEEPER_LPWM_PIN = 23, SWEEPER_LPWM_CHANNEL = 5;
+
+// Status LED pins (moved from GPIO2/15 due to boot strapping conflicts)
+const int LED_GREEN_PIN  = 21;
+const int LED_YELLOW_PIN = 22;
+const int LED_RED_PIN    = 33;
+
+// Sweeper ramp: non-blocking, 1.5 seconds, 25% max duty cycle
+const int SWEEPER_TARGET_PWM       = PWM_MAX / 4;
+const unsigned long SWEEPER_RAMP_MS = 1500;
+
+// Software trim for straight-line drift correction (adjust one side only)
+const int LEFT_TRIM  = 0;
+const int RIGHT_TRIM = 0;
+
+unsigned long sweeperRampStartMs   = 0;
+int sweeperRampStartValue          = 0;
+int sweeperRampTargetValue         = 0;
+int g_sweeperPWM                   = 0;
+
+const unsigned long PRINT_INTERVAL_MS = 100;
+unsigned long lastPrintMs             = 0;
+
+int g_axisYRaw = 0, g_axisRXRaw = 0, g_throttle = 0, g_turn = 0;
+int g_leftPWM  = 0, g_rightPWM  = 0;
+
+// Autonomous mode parameters
+const int   UART_PACKET_SIZE   = 8;
+const float AUTONOMOUS_KP      = 0.5;
+const int   AUTONOMOUS_SPEED   = 102;
+const int   AUTO_MAX_PWM       = 102;
+const int   CAPTURE_SPEED      = 102;
+const unsigned long UART_TIMEOUT_MS    = 2000;
+const unsigned long CAPTURE_DRIVE_MS  = 1200;
+const unsigned long SEARCH_TIMEOUT_MS = 10000;
+const unsigned long DETECTION_DROPOUT_MS = 800;
+
+int16_t  g_bearingMrad       = 0;
+float    g_groundDistM        = 0.0f;
+uint8_t  g_modeFlag           = 0;
+unsigned long g_lastValidPacketMs = 0;
+unsigned long g_lastDetectionMs   = 0;
+
+bool          g_captureDriving = false;
+unsigned long g_captureStartMs = 0;
+
+// Forward declarations required by Arduino's auto-prototype insertion
+void triggerSafeStop(const char* reason);
+int  clampToMax(int value, int maxVal);
+void updateModeLEDs();
+
+struct MotorOutput {
+    int leftSpeed;
+    int rightSpeed;
+};
+
+// ============================================================================
+// BLUETOOTH CONNECTION CALLBACKS
+// Bluepad32 calls these automatically when the PS5 controller connects or
+// disconnects. On connect, the LED reflects the current mode. On disconnect,
+// the e-stop triggers immediately rather than waiting for the 1500ms timeout.
+// ============================================================================
+
+void onConnectedController(ControllerPtr ctl) {
+    if (myController == nullptr) {
+        Serial.printf("Controller connected, index=%d\n", ctl->index());
+        myController = ctl;
+        lastControllerUpdateMs = millis();
+        updateModeLEDs();
+    } else {
+        Serial.println("Controller connected, but slot already occupied, ignoring");
+    }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+    if (myController == ctl) {
+        Serial.println("Controller disconnected");
+        myController = nullptr;
+        triggerSafeStop("controller disconnected");
+    }
+}
+
+// ============================================================================
+// MOTOR DRIVER FUNCTIONS
+// driveMotor() translates a single signed speed value into the two-channel
+// PWM signals the BTS7960 expects. Only one of R_PWM or L_PWM is ever
+// nonzero at a time, preventing shoot-through. stopAllMotors() zeros the
+// drive wheels only. The sweeper has its own stop function because it
+// carries additional ramp state that needs resetting.
+// ============================================================================
+
+void driveMotor(int rpwmChannel, int lpwmChannel, int speed) {
+    speed = clampToMax(speed, PWM_MAX);
+    if (speed > 0) {
+        ledcWrite(rpwmChannel, speed);
+        ledcWrite(lpwmChannel, 0);
+    } else if (speed < 0) {
+        ledcWrite(rpwmChannel, 0);
+        ledcWrite(lpwmChannel, -speed);
+    } else {
+        ledcWrite(rpwmChannel, 0);
+        ledcWrite(lpwmChannel, 0);
+    }
+}
+
+void stopAllMotors() {
+    driveMotor(LEFT_RPWM_CHANNEL,  LEFT_LPWM_CHANNEL,  0);
+    driveMotor(RIGHT_RPWM_CHANNEL, RIGHT_LPWM_CHANNEL, 0);
+    g_leftPWM  = 0;
+    g_rightPWM = 0;
+}
+
+void stopSweeperInstant() {
+    driveMotor(SWEEPER_RPWM_CHANNEL, SWEEPER_LPWM_CHANNEL, 0);
+    g_sweeperPWM        = 0;
+    sweeperRampStartValue  = 0;
+    sweeperRampTargetValue = 0;
+    sweeperRampStartMs     = millis();
+    sweeperRunning         = false;
+}
+
+// ============================================================================
+// LED STATE MANAGEMENT
+// All LED state flows through updateModeLEDs(). This single function reads
+// the current mode and e-stop state and sets all three LEDs accordingly.
+// If e-stop is active it returns immediately, so the red fault LED cannot
+// be cleared by any mode change event - only clearSafeStop() clears it.
+// ============================================================================
+
+void updateModeLEDs() {
+    if (eStopActive) return;
+    digitalWrite(LED_GREEN_PIN,  currentMode == MODE_MANUAL     ? HIGH : LOW);
+    digitalWrite(LED_YELLOW_PIN, currentMode == MODE_AUTONOMOUS ? HIGH : LOW);
+}
+
+// ============================================================================
+// SAFETY FUNCTIONS
+// triggerSafeStop() is the single entry point for all fault conditions.
+// It prints only on the first call (transition detection), zeros all motors
+// including the sweeper, and illuminates the red LED. The e-stop persists
+// through controller reconnection - the operator must press Circle to
+// acknowledge before any motion is permitted.
+// ============================================================================
+
+void triggerSafeStop(const char* reason) {
+    if (!eStopActive) {
+        Serial.printf("SAFE-STOP triggered: %s\n", reason);
+    }
+    eStopActive = true;
+    stopAllMotors();
+    stopSweeperInstant();
+    digitalWrite(LED_RED_PIN,    HIGH);
+    digitalWrite(LED_GREEN_PIN,  LOW);
+    digitalWrite(LED_YELLOW_PIN, LOW);
+}
+
+void clearSafeStop() {
+    eStopActive = false;
+    digitalWrite(LED_RED_PIN, LOW);
+    updateModeLEDs();
+    Serial.println("Safe-stop cleared");
+}
+
+// ============================================================================
+// INPUT HELPER FUNCTIONS
+// applyDeadzone() prevents small mechanical noise in the joystick from
+// producing unwanted motor output when the stick is at rest. clampToMax()
+// hard-limits a value to a symmetric range. computeSkidSteer() implements
+// the arcade-style differential drive mixing where the left stick controls
+// forward speed and the right stick steers by differentially splitting power
+// between the two drive motors.
+// ============================================================================
+
+int applyDeadzone(int value, int deadzone) {
+    if (abs(value) < deadzone) return 0;
+    return value;
+}
+
+int clampToMax(int value, int maxVal) {
+    if (value >  maxVal) return  maxVal;
+    if (value < -maxVal) return -maxVal;
+    return value;
+}
+
+MotorOutput computeSkidSteer(int throttleRaw, int turnRaw) {
+    int throttle = clampToMax(throttleRaw, JOYSTICK_MAX);
+    int turn     = clampToMax(turnRaw,     JOYSTICK_MAX);
+    int left     = clampToMax(throttle + turn, JOYSTICK_MAX);
+    int right    = clampToMax(throttle - turn, JOYSTICK_MAX);
+    MotorOutput out;
+    out.leftSpeed  = map(left,  -JOYSTICK_MAX, JOYSTICK_MAX, -PWM_MAX, PWM_MAX);
+    out.rightSpeed = map(right, -JOYSTICK_MAX, JOYSTICK_MAX, -PWM_MAX, PWM_MAX);
+    return out;
+}
+
+// ============================================================================
+// SWEEPER RAMP
+// The sweeper accelerates and decelerates over 1500ms using linear
+// interpolation computed every loop iteration (non-blocking). A new ramp
+// always starts from the sweeper's current actual speed, so pressing Cross
+// mid-ramp produces a smooth direction reversal. E-stop bypasses the ramp
+// and cuts the sweeper instantly via stopSweeperInstant().
+// ============================================================================
+
+void setSweeperTarget(int target) {
+    sweeperRampStartMs    = millis();
+    sweeperRampStartValue = g_sweeperPWM;
+    sweeperRampTargetValue = target;
+}
+
+void updateSweeperRamp() {
+    if (g_sweeperPWM == sweeperRampTargetValue) return;
+    unsigned long elapsed = millis() - sweeperRampStartMs;
+    if (elapsed >= SWEEPER_RAMP_MS) {
+        g_sweeperPWM = sweeperRampTargetValue;
+    } else {
+        g_sweeperPWM = sweeperRampStartValue +
+            (long)(sweeperRampTargetValue - sweeperRampStartValue)
+            * (long)elapsed / (long)SWEEPER_RAMP_MS;
+    }
+    driveMotor(SWEEPER_RPWM_CHANNEL, SWEEPER_LPWM_CHANNEL, g_sweeperPWM);
+}
+
+// ============================================================================
+// UART PACKET PARSER
+// Reads 8-byte packets from the Raspberry Pi arriving at 10Hz. Each packet
+// contains the bearing error (horizontal angle to the target in milliradians),
+// ground distance (metres), and a mode flag indicating whether a ball is
+// visible. The XOR checksum validates packet integrity. Corrupted packets are
+// discarded silently.
+// ============================================================================
+
+bool parseUartPacket() {
+    static uint8_t buf[UART_PACKET_SIZE];
+    static int     bytesRead = 0;
+
+    while (Serial2.available() > 0 && bytesRead < UART_PACKET_SIZE) {
+        buf[bytesRead++] = Serial2.read();
+    }
+    if (bytesRead < UART_PACKET_SIZE) return false;
+    bytesRead = 0;
+
+    uint8_t checksum = 0;
+    for (int i = 0; i < 7; i++) checksum ^= buf[i];
+    if (checksum != buf[7]) {
+        Serial.println("UART: checksum mismatch, packet discarded");
+        return false;
+    }
+
+    g_bearingMrad = (int16_t)((buf[0] << 8) | buf[1]);
+    uint32_t raw  = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16)
+                  | ((uint32_t)buf[4] <<  8) |  (uint32_t)buf[5];
+    memcpy(&g_groundDistM, &raw, sizeof(float));
+    g_modeFlag          = buf[6];
+    g_lastValidPacketMs = millis();
+    if (g_modeFlag == 1) g_lastDetectionMs = millis();
+    return true;
+}
+
+// ============================================================================
+// AUTONOMOUS STEERING
+// Implements the three-zone vision architecture. A task complete check runs
+// first outside all zones and returns to manual after 10 seconds of no
+// detection. Zone 3 (Capture): ball in blind spot, fixed forward drive.
+// Zone 1 (Search): no packet for 2s OR flag has been 0 for more than 800ms,
+// robot executes a slow pivot. Brief detection dropouts under 800ms are
+// ignored and the robot holds its last approach trajectory. Zone 2 (Approach):
+// ball detected, robot steers proportionally toward the bearing error.
+// All autonomous motor outputs are hard-capped at AUTO_MAX_PWM (40% PWM).
+// ============================================================================
+
+void runAutonomousSteering() {
+    unsigned long now = millis();
+
+    // Task complete check outside all zones. Fires after SEARCH_TIMEOUT_MS
+    // of no detection regardless of which zone the robot is currently in.
+    if (now - g_lastDetectionMs > SEARCH_TIMEOUT_MS && !g_captureDriving) {
+        Serial.println("SEARCH timeout: no ball found, task complete, returning to MANUAL");
+        currentMode      = MODE_MANUAL;
+        g_captureDriving = false;
+        stopAllMotors();
+        updateModeLEDs();
+        return;
+    }
+
+    // Zone 3: capture drive in progress, ignore all UART input
+    if (g_captureDriving) {
+        if (now - g_captureStartMs < CAPTURE_DRIVE_MS) {
+            int capSpeed = constrain(CAPTURE_SPEED, 0, AUTO_MAX_PWM);
+            driveMotor(LEFT_RPWM_CHANNEL,  LEFT_LPWM_CHANNEL,  capSpeed);
+            driveMotor(RIGHT_RPWM_CHANNEL, RIGHT_LPWM_CHANNEL, capSpeed);
+            g_leftPWM  = capSpeed;
+            g_rightPWM = capSpeed;
+        } else {
+            g_captureDriving = false;
+            stopAllMotors();
+            Serial.println("CAPTURE complete, returning to SEARCH");
+        }
+        return;
+    }
+
+    // Zone 1: search sweep. Only enters if UART silent OR flag has been 0
+    // for longer than DETECTION_DROPOUT_MS. Brief dropouts are ignored.
+    if (now - g_lastValidPacketMs > UART_TIMEOUT_MS ||
+       (g_modeFlag == 0 && now - g_lastDetectionMs > DETECTION_DROPOUT_MS)) {
+        int searchSpeed = constrain(75, 0, AUTO_MAX_PWM);
+        driveMotor(LEFT_RPWM_CHANNEL,  LEFT_LPWM_CHANNEL,   searchSpeed + LEFT_TRIM);
+        driveMotor(RIGHT_RPWM_CHANNEL, RIGHT_LPWM_CHANNEL, -searchSpeed + RIGHT_TRIM);
+        g_leftPWM  =  searchSpeed;
+        g_rightPWM = -searchSpeed;
+        return;
+    }
+
+    // Zone 2: approach. g_lastDetectionMs updated in parseUartPacket() only,
+    // NOT here, to allow the dropout timer to accumulate correctly.
+    if (g_groundDistM > 0.0f && g_groundDistM < 0.15f) {
+        Serial.printf("CAPTURE triggered at %.3fm, driving forward %dms\n",
+                      g_groundDistM, CAPTURE_DRIVE_MS);
+        g_captureDriving = true;
+        g_captureStartMs = now;
+        return;
+    }
+
+    int turnOffset = (int)(AUTONOMOUS_KP * (float)g_bearingMrad / 10.0f);
+    turnOffset = clampToMax(turnOffset, AUTO_MAX_PWM);
+
+    int leftSpeed  = constrain(AUTONOMOUS_SPEED + turnOffset + LEFT_TRIM,  -AUTO_MAX_PWM, AUTO_MAX_PWM);
+    int rightSpeed = constrain(AUTONOMOUS_SPEED - turnOffset + RIGHT_TRIM, -AUTO_MAX_PWM, AUTO_MAX_PWM);
+
+    driveMotor(LEFT_RPWM_CHANNEL,  LEFT_LPWM_CHANNEL,  leftSpeed);
+    driveMotor(RIGHT_RPWM_CHANNEL, RIGHT_LPWM_CHANNEL, rightSpeed);
+    g_leftPWM  = leftSpeed;
+    g_rightPWM = rightSpeed;
+}
+
+// ============================================================================
+// GAMEPAD INPUT PROCESSING
+// Reads the PS5 controller every time Bluepad32 has new data. Button mapping
+// confirmed via bitmask bench testing on the actual unit. R3 triggers a
+// software ESP32 reset (useful for resyncing the UART link after boot).
+// Triangle triggers the e-stop. Circle clears it. Square toggles mode and
+// auto-starts the sweeper on entry to autonomous. Cross toggles the sweeper
+// with a 1.5 second ramp. Joystick deflection in autonomous mode immediately
+// returns to manual without stopping the sweeper.
+// ============================================================================
+
+void processGamepad(ControllerPtr ctl) {
+    lastControllerUpdateMs = millis();
+
+    // R3 confirmed bitmask 0x0200 on this DualSense unit
+    if (ctl->buttons() & 0x0200) {
+        Serial.println("R3 pressed: ESP32 resetting...");
+        delay(100);
+        ESP.restart();
+    }
+
+    // Triangle = y() = e-stop (no edge detect, holding always means stop)
+    if (ctl->y()) {
+        triggerSafeStop("Triangle pressed");
+    }
+
+    // Square = x() = mode toggle (edge-detected)
+    static bool squarePrev = false;
+    bool squareNow = ctl->x();
+    if (squareNow && !squarePrev && !eStopActive) {
+        currentMode = (currentMode == MODE_MANUAL) ? MODE_AUTONOMOUS : MODE_MANUAL;
+        updateModeLEDs();
+        if (currentMode == MODE_AUTONOMOUS) {
+            if (!sweeperRunning) {
+                sweeperRunning = true;
+                setSweeperTarget(SWEEPER_TARGET_PWM);
+                Serial.println("Autonomous mode: sweeper auto-started");
+            }
+            g_lastDetectionMs = millis();
+        }
+        Serial.printf("Mode switched to: %s\n",
+                      currentMode == MODE_MANUAL ? "MANUAL" : "AUTONOMOUS");
+    }
+    squarePrev = squareNow;
+
+    // Cross = a() = sweeper toggle with ramp (edge-detected)
+    static bool crossPrev = false;
+    bool crossNow = ctl->a();
+    if (crossNow && !crossPrev && !eStopActive) {
+        sweeperRunning = !sweeperRunning;
+        Serial.printf("Sweeper: %s (ramping)\n", sweeperRunning ? "ON" : "OFF");
+        setSweeperTarget(sweeperRunning ? SWEEPER_TARGET_PWM : 0);
+    }
+    crossPrev = crossNow;
+
+    // Circle = b() = clear e-stop (edge-detected, only while e-stop active)
+    static bool circlePrev = false;
+    bool circleNow = ctl->b();
+    if (circleNow && !circlePrev && eStopActive) {
+        clearSafeStop();
+    }
+    circlePrev = circleNow;
+
+    // Manual mode driving
+    if (currentMode == MODE_MANUAL && !eStopActive) {
+        int throttleRaw = applyDeadzone(-ctl->axisY(), JOYSTICK_DEADZONE);
+        int turnRaw     = applyDeadzone( ctl->axisRX(), JOYSTICK_DEADZONE);
+        MotorOutput out = computeSkidSteer(throttleRaw, turnRaw);
+        driveMotor(LEFT_RPWM_CHANNEL,  LEFT_LPWM_CHANNEL,  out.leftSpeed  + LEFT_TRIM);
+        driveMotor(RIGHT_RPWM_CHANNEL, RIGHT_LPWM_CHANNEL, out.rightSpeed + RIGHT_TRIM);
+        g_axisYRaw  = ctl->axisY();
+        g_axisRXRaw = ctl->axisRX();
+        g_throttle  = throttleRaw;
+        g_turn      = turnRaw;
+        g_leftPWM   = out.leftSpeed;
+        g_rightPWM  = out.rightSpeed;
+    }
+
+    // Joystick override in autonomous mode (sweeper continues)
+    if (currentMode == MODE_AUTONOMOUS) {
+        int throttleCheck = applyDeadzone(-ctl->axisY(),  JOYSTICK_DEADZONE);
+        int turnCheck     = applyDeadzone( ctl->axisRX(), JOYSTICK_DEADZONE);
+        if (throttleCheck != 0 || turnCheck != 0) {
+            currentMode      = MODE_MANUAL;
+            g_captureDriving = false;
+            stopAllMotors();
+            updateModeLEDs();
+            Serial.println("Joystick override: forced back to MANUAL mode (sweeper continues)");
+        }
+    }
+}
+
+void processControllers() {
+    if (myController && myController->isConnected() && myController->hasData()) {
+        if (myController->isGamepad()) processGamepad(myController);
+        else Serial.println("Connected device is not a gamepad, ignoring");
+    }
+}
+
+void printStatus() {
+    Serial.printf(
+        "mode=%s, estop=%s, sweeper=%s, sweeperPWM=%4d, "
+        "bearing=%5dmrad, dist=%.3fm, flag=%d, "
+        "axisY=%4d, axisRX=%4d, leftPWM=%4d, rightPWM=%4d\n",
+        currentMode == MODE_MANUAL ? "MANUAL" : "AUTO",
+        eStopActive    ? "ACTIVE" : "clear",
+        sweeperRunning ? "ON"     : "off",
+        g_sweeperPWM, g_bearingMrad, g_groundDistM, g_modeFlag,
+        g_axisYRaw, g_axisRXRaw, g_leftPWM, g_rightPWM);
+}
+
+// ============================================================================
+// SETUP AND LOOP
+// setup() configures all hardware in the correct order: PWM channels first
+// (to claim GPIO pins before Bluetooth starts), then Bluetooth, then UART,
+// then LEDs, then boot into e-stop state, then hardware watchdog last.
+// loop() runs the Bluetooth update, timeout checks, UART parser, autonomous
+// steering, sweeper ramp, and telemetry print on every iteration.
+// ============================================================================
+
+void setup() {
+    Serial.begin(115200);
+
+    ledcSetup(LEFT_RPWM_CHANNEL,    PWM_FREQ, PWM_RESOLUTION_BITS);
+    ledcAttachPin(LEFT_RPWM_PIN,    LEFT_RPWM_CHANNEL);
+    ledcSetup(LEFT_LPWM_CHANNEL,    PWM_FREQ, PWM_RESOLUTION_BITS);
+    ledcAttachPin(LEFT_LPWM_PIN,    LEFT_LPWM_CHANNEL);
+    ledcSetup(RIGHT_RPWM_CHANNEL,   PWM_FREQ, PWM_RESOLUTION_BITS);
+    ledcAttachPin(RIGHT_RPWM_PIN,   RIGHT_RPWM_CHANNEL);
+    ledcSetup(RIGHT_LPWM_CHANNEL,   PWM_FREQ, PWM_RESOLUTION_BITS);
+    ledcAttachPin(RIGHT_LPWM_PIN,   RIGHT_LPWM_CHANNEL);
+    ledcSetup(SWEEPER_RPWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION_BITS);
+    ledcAttachPin(SWEEPER_RPWM_PIN, SWEEPER_RPWM_CHANNEL);
+    ledcSetup(SWEEPER_LPWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION_BITS);
+    ledcAttachPin(SWEEPER_LPWM_PIN, SWEEPER_LPWM_CHANNEL);
+    stopAllMotors();
+    stopSweeperInstant();
+
+    Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
+    BP32.setup(&onConnectedController, &onDisconnectedController);
+    BP32.enableVirtualDevice(false);
+
+    Serial2.begin(115200, SERIAL_8N1, 16, 17);
+    g_lastValidPacketMs = millis();
+    g_lastDetectionMs   = millis();
+    Serial.println("UART2 to Pi initialised on GPIO16/17 at 115200 baud");
+
+    pinMode(LED_GREEN_PIN,  OUTPUT);
+    pinMode(LED_YELLOW_PIN, OUTPUT);
+    pinMode(LED_RED_PIN,    OUTPUT);
+    digitalWrite(LED_GREEN_PIN,  LOW);
+    digitalWrite(LED_YELLOW_PIN, LOW);
+    digitalWrite(LED_RED_PIN,    LOW);
+
+    eStopActive = true;
+    digitalWrite(LED_RED_PIN, HIGH);
+    Serial.println("Boot e-stop active. Press Circle to acknowledge and clear.");
+
+    esp_task_wdt_init(3, true);
+    esp_task_wdt_add(NULL);
+}
+
+void loop() {
+    bool dataUpdated = BP32.update();
+    if (dataUpdated) processControllers();
+
+    if (myController != nullptr &&
+        (millis() - lastControllerUpdateMs > CONTROLLER_TIMEOUT_MS)) {
+        if (!eStopActive) triggerSafeStop("controller update timeout");
+    }
+
+    parseUartPacket();
+
+    if (currentMode == MODE_AUTONOMOUS && !eStopActive) {
+        runAutonomousSteering();
+    }
+
+    updateSweeperRamp();
+
+    if (millis() - lastPrintMs >= PRINT_INTERVAL_MS) {
+        printStatus();
+        lastPrintMs = millis();
+    }
+
+    vTaskDelay(1);
+    esp_task_wdt_reset();
+}
+
+
+================================================================================
+PART 2: RASPBERRY PI 5 - SETUP COMMANDS
+================================================================================
+
+These commands were run in order on the Pi terminal or via SSH to configure
+the operating system, install dependencies, and prepare the project directory.
+Run them once on a fresh OS installation.
+
+--------------------------------------------------------------------------------
+SYSTEM CONFIGURATION
+--------------------------------------------------------------------------------
+
+Enable hardware UART (required for ESP32 communication):
+  sudo nano /boot/firmware/config.txt
+  [add at bottom]: enable_uart=1
+
+  sudo nano /boot/firmware/cmdline.txt
+  [remove this part from the single line]: console=serial0,115200
+
+  sudo reboot
+
+Set static IP address:
+  sudo nmcli con mod "$(nmcli -t -f NAME con show --active | head -1)" \
+    ipv4.addresses 192.168.0.29/24 ipv4.gateway 192.168.0.1 \
+    ipv4.dns 8.8.8.8 ipv4.method manual
+  sudo nmcli con up "$(nmcli -t -f NAME con show --active | head -1)"
+
+Enable SSH:
+  sudo systemctl enable ssh
+  sudo systemctl start ssh
+
+Create project directory:
+  mkdir -p /home/nunro/harvest
+
+Disable WiFi power management (prevents download timeouts):
+  sudo iwconfig wlan0 power off
+
+--------------------------------------------------------------------------------
+PYTHON DEPENDENCIES
+--------------------------------------------------------------------------------
+
+Install PyTorch CPU-only (ARM-native, no CUDA):
+  pip3 install torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --break-system-packages --resume-retries 10 --timeout 120
+
+Install ultralytics (YOLO framework, no auto-dependencies):
+  pip3 install ultralytics --no-deps --break-system-packages --timeout 120
+
+Install remaining packages:
+  pip3 install opencv-python-headless pyserial matplotlib \
+    --break-system-packages --resume-retries 10 --timeout 120
+
+Install NCNN and PNNX for ARM-optimised inference:
+  pip3 install ncnn --break-system-packages --timeout 120 --resume-retries 5
+  pip3 install pnnx==20260526 --break-system-packages --timeout 120
+
+Install remaining ultralytics optional packages:
+  pip3 install ultralytics-thop nvidia-ml-py \
+    --break-system-packages --timeout 120
+
+Add local bin to PATH (prevents install warnings):
+  echo 'export PATH=$PATH:/home/nunro/.local/bin' >> ~/.bashrc
+  source ~/.bashrc
+
+Verify all imports work:
+  python3 -c "import torch; import cv2; import serial; \
+    from ultralytics import YOLO; print('All imports OK')"
+
+--------------------------------------------------------------------------------
+MODEL DOWNLOAD AND EXPORT
+--------------------------------------------------------------------------------
+
+Download base YOLOv8n model (used for pipeline testing):
+  python3 -c "from ultralytics import YOLO; \
+    model = YOLO('yolov8n.pt'); print('Model downloaded OK')"
+  mv ~/yolov8n.pt /home/nunro/harvest/
+
+Copy custom trained model from laptop to Pi (run on laptop PowerShell):
+  scp C:\path\to\best.pt nunro@192.168.0.29:/home/nunro/harvest/
+
+Export to NCNN format for 3x faster inference on Pi 5 CPU:
+  [create /home/nunro/harvest/export_ncnn.py with this content:]
+
+    from ultralytics import YOLO
+    model = YOLO('/home/nunro/harvest/best.pt')
+    model.export(format='ncnn', imgsz=640)
+    print('Export complete')
+
+  python3 /home/nunro/harvest/export_ncnn.py
+
+Benchmark inference speed:
+  [create /home/nunro/harvest/benchmark.py with this content:]
+
+    import time
+    from ultralytics import YOLO
+    import numpy as np
+    model = YOLO('/home/nunro/harvest/best_ncnn_model')
+    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    times = []
+    for i in range(30):
+        t = time.monotonic()
+        model(dummy, verbose=False)
+        times.append(time.monotonic() - t)
+    print(f'Average inference: {sum(times)/len(times)*1000:.1f}ms')
+    print(f'FPS: {1/(sum(times)/len(times)):.1f}')
+
+  python3 /home/nunro/harvest/benchmark.py
+  [Expected result: approximately 9.2 FPS on Pi 5 CPU]
+
+--------------------------------------------------------------------------------
+HOTSPOT FOR FIELD USE
+--------------------------------------------------------------------------------
+
+Configure Pi to broadcast its own WiFi network (no router needed):
+  sudo nmcli device wifi hotspot ifname wlan0 \
+    ssid "HarvestBot" password "harvest2026"
+  sudo nmcli con mod Hotspot connection.autoconnect yes
+
+Connect phone/laptop to "HarvestBot" (password: harvest2026)
+SSH in field: ssh nunro@10.42.0.1
+Stream in field: http://10.42.0.1:8080/stream
+
+--------------------------------------------------------------------------------
+SYSTEMD AUTO-START SERVICE
+--------------------------------------------------------------------------------
+
+Create service file:
+  sudo nano /etc/systemd/system/harvest_vision.service
+
+  [paste this content:]
+  [Unit]
+  Description=MCTR 474 Macadamia Harvesting Vision Pipeline
+  After=multi-user.target
+
+  [Service]
+  Type=simple
+  User=nunro
+  WorkingDirectory=/home/nunro/harvest
+  Environment=PYTHONPATH=/home/nunro/.local/lib/python3.13/site-packages
+  ExecStart=/usr/bin/python3 /home/nunro/harvest/harvest_vision.py
+  Restart=on-failure
+  RestartSec=5
+  StandardOutput=journal
+  StandardError=journal
+
+  [Install]
+  WantedBy=multi-user.target
+
+Enable and start:
+  sudo systemctl enable harvest_vision.service
+  sudo systemctl start harvest_vision.service
+
+Check status:
+  sudo systemctl status harvest_vision.service
+
+View live log:
+  sudo journalctl -u harvest_vision.service -f
+
+Restart after script changes:
+  sudo systemctl restart harvest_vision.service
+
+--------------------------------------------------------------------------------
+YOLO MODEL TRAINING (Google Colab, run once)
+--------------------------------------------------------------------------------
+
+The custom golf ball model was trained on Google Colab using a T4 GPU.
+Dataset sourced from Roboflow Universe, merged and re-annotated into a
+single "golf-ball" class. Training took 0.576 hours for 100 epochs.
+
+Colab training commands (for reference if retraining is needed):
+
+  !pip install ultralytics
+
+  !rm -rf dataset roboflow.zip
+  !curl -L "https://app.roboflow.com/ds/stMVVYWIR0?key=KqzAL6XBxe" \
+    -o roboflow.zip
+  !mkdir dataset
+  !unzip -oq roboflow.zip -d dataset
+  !rm roboflow.zip
+
+  yaml_content = """train: train/images
+  val: valid/images
+  test: test/images
+  nc: 1
+  names: ['golf-ball']
+  """
+  with open('dataset/data.yaml', 'w') as f:
+      f.write(yaml_content)
+
+  import torch
+  print(torch.cuda.is_available())  # must print True before training
+
+  from ultralytics import YOLO
+  model = YOLO('yolov8n.pt')
+  results = model.train(
+      data='dataset/data.yaml',
+      epochs=100,
+      imgsz=640,
+      batch=16,
+      patience=20,
+      project='golf_ball_training',
+      name='yolov8n_run1'
+  )
+
+Download trained weights from Colab:
+  !zip -r golf_ball_run1_results.zip \
+    /content/runs/detect/golf_ball_training/yolov8n_run1
+  from google.colab import files
+  files.download('golf_ball_run1_results.zip')
+
+Model performance (test split, 49 images, fully unseen):
+  Precision: 0.880, Recall: 0.829, mAP50: 0.874, mAP50-95: 0.591
+
+
+================================================================================
+PART 3: RASPBERRY PI 5 - VISION PIPELINE SCRIPT
+================================================================================
+
+This is the complete, current harvest_vision.py. It opens the camera,
+loads the NCNN golf ball model, runs inference at 10Hz, computes bearing
+error and ground distance from detections, transmits 8-byte UART packets
+to the ESP32, and simultaneously serves a live MJPEG stream with detection
+overlay on port 8080. The script is designed to run as a systemd service
+and requires no user interaction after startup.
+
+Save this file to /home/nunro/harvest/harvest_vision.py
+
+--------------------------------------------------------------------------------
+
+#!/usr/bin/env python3
+"""
+MCTR 474 - Macadamia Harvesting Robot - Vision Pipeline
+Raspberry Pi 5, Camera Module 3 Wide
+Nunro Brenkman 37540505 - NWU Potchefstroom
+"""
+
+import time
+import struct
+import serial
+import threading
+import numpy as np
+import cv2
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from picamera2 import Picamera2
+from ultralytics import YOLO
+
+# ============================================================================
+# CONFIGURATION
+# All tunable parameters in one place.
+# ============================================================================
+
+UART_PORT            = "/dev/ttyAMA0"
+UART_BAUD            = 115200
+MODEL_PATH           = "/home/nunro/harvest/best_ncnn_model"
+INFERENCE_WIDTH      = 640
+INFERENCE_HEIGHT     = 480
+CAMERA_HEIGHT_MM     = 220.0
+DEPRESSION_DEG       = 25.0
+CAMERA_OFFSET_MM     = 10.0
+FOCAL_LENGTH_PX      = 259.1   # PLACEHOLDER - replace with calibrated value
+PACKET_RATE_HZ       = 10
+CONFIDENCE_THRESHOLD = 0.5
+SPORTS_BALL_CLASS_ID = 0       # class 0 = golf-ball in the custom model
+STREAM_PORT          = 8080
+
+# ============================================================================
+# SHARED FRAME BUFFER
+# The main inference thread writes frames here. The HTTP stream thread reads
+# from it. A lock prevents corruption when both threads access it at once.
+# ============================================================================
+
+latest_frame_jpg = None
+frame_lock = threading.Lock()
+
+# ============================================================================
+# MJPEG STREAMING SERVER
+# Runs in a background daemon thread. Serves a multipart JPEG stream that
+# any browser or VLC can display. Frames include a green bounding box and
+# telemetry overlay when a ball is detected, and a red SEARCHING label when
+# not. The stream updates at approximately 10fps matching the inference rate.
+# ============================================================================
+
+class MjpegHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(302)
+            self.send_header('Location', '/stream')
+            self.end_headers()
+        elif self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type',
+                             'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            try:
+                while True:
+                    with frame_lock:
+                        jpg = latest_frame_jpg
+                    if jpg is not None:
+                        self.wfile.write(b'--frame\r\n')
+                        self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                        self.wfile.write(jpg)
+                        self.wfile.write(b'\r\n')
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def stream_server_thread():
+    server = HTTPServer(('0.0.0.0', STREAM_PORT), MjpegHandler)
+    print(f"MJPEG stream on port {STREAM_PORT}")
+    print(f"  Home WiFi:  http://192.168.0.29:{STREAM_PORT}/stream")
+    print(f"  Pi hotspot: http://10.42.0.1:{STREAM_PORT}/stream")
+    server.serve_forever()
+
+# ============================================================================
+# CAMERA GEOMETRY
+# These two functions convert pixel coordinates into real-world measurements.
+# pixel_to_bearing_mrad() computes the horizontal angle from the camera
+# optical axis to the detected ball (positive = right, negative = left).
+# pixel_to_ground_distance() uses the known camera height and depression angle
+# to estimate how far ahead the ball is on the ground plane.
+# ============================================================================
+
+def pixel_to_bearing_mrad(pixel_x, frame_width, focal_length_px):
+    pixel_offset = pixel_x - (frame_width / 2.0)
+    bearing_rad  = np.arctan2(pixel_offset, focal_length_px)
+    bearing_mrad = int(bearing_rad * 1000.0)
+    return max(-32768, min(32767, bearing_mrad))
+
+def pixel_to_ground_distance(pixel_y, frame_height, focal_length_px,
+                              camera_height_mm, depression_deg):
+    pixel_offset_from_centre = pixel_y - (frame_height / 2.0)
+    angle_from_axis_rad      = np.arctan2(pixel_offset_from_centre, focal_length_px)
+    total_depression_rad     = np.radians(depression_deg) + angle_from_axis_rad
+    if total_depression_rad <= 0.0:
+        return 0.0
+    return (camera_height_mm / np.tan(total_depression_rad)) / 1000.0
+
+# ============================================================================
+# UART PACKET BUILDER
+# Packs the bearing, distance, and mode flag into 8 bytes using big-endian
+# byte order, then appends an XOR checksum. The ESP32 parser validates the
+# checksum and discards corrupted packets.
+# ============================================================================
+
+def build_packet(bearing_mrad, ground_distance_m, mode_flag):
+    payload  = struct.pack(">hfB", int(bearing_mrad),
+                           float(ground_distance_m), int(mode_flag))
+    checksum = 0
+    for byte in payload:
+        checksum ^= byte
+    return payload + struct.pack("B", checksum)
+
+# ============================================================================
+# MAIN PIPELINE
+# Initialises the stream server, UART link, YOLO model, and camera in order.
+# The inference loop captures frames, runs detection, draws the overlay for
+# the stream, computes geometry for the UART packet, and transmits at 10Hz.
+# Timing is managed with sleep to hold the target frame rate.
+# ============================================================================
+
+def main():
+    global latest_frame_jpg
+    print("MCTR 474 Vision Pipeline starting...")
+
+    t = threading.Thread(target=stream_server_thread, daemon=True)
+    t.start()
+
+    print(f"Opening UART on {UART_PORT} at {UART_BAUD} baud...")
+    try:
+        uart = serial.Serial(UART_PORT, UART_BAUD, timeout=1)
+        print("UART open.")
+    except serial.SerialException as e:
+        print(f"ERROR: Could not open UART: {e}")
+        raise
+
+    print(f"Loading YOLO model from {MODEL_PATH}...")
+    try:
+        model = YOLO(MODEL_PATH)
+        print("Model loaded.")
+    except Exception as e:
+        print(f"ERROR: Could not load model: {e}")
+        raise
+
+    print("Initialising camera...")
+    picam2  = Picamera2()
+    config  = picam2.create_preview_configuration(
+        main={"size": (INFERENCE_WIDTH, INFERENCE_HEIGHT), "format": "RGB888"})
+    picam2.configure(config)
+    picam2.set_controls({"AfMode": 0, "LensPosition": 1.25})
+    picam2.start()
+    print("Camera started with fixed focus at 0.8m.")
+    time.sleep(1.0)
+
+    print(f"Entering main inference loop at {PACKET_RATE_HZ}Hz.")
+    period     = 1.0 / PACKET_RATE_HZ
+    loop_count = 0
+
+    while True:
+        loop_start = time.monotonic()
+        frame      = picam2.capture_array()
+        results    = model(frame, verbose=False)
+
+        bearing_mrad  = 0
+        ground_dist_m = 0.0
+        mode_flag     = 0
+        best_conf     = 0.0
+        best_box      = None
+
+        for result in results:
+            for box in result.boxes:
+                if int(box.cls[0]) != SPORTS_BALL_CLASS_ID:
+                    continue
+                conf = float(box.conf[0])
+                if conf < CONFIDENCE_THRESHOLD:
+                    continue
+                if conf > best_conf:
+                    best_conf = conf
+                    best_box  = box
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    bearing_mrad  = pixel_to_bearing_mrad(
+                        cx, INFERENCE_WIDTH, FOCAL_LENGTH_PX)
+                    ground_dist_m = pixel_to_ground_distance(
+                        cy, INFERENCE_HEIGHT, FOCAL_LENGTH_PX,
+                        CAMERA_HEIGHT_MM, DEPRESSION_DEG)
+                    if 0.05 < ground_dist_m < 3.0:
+                        mode_flag = 1
+
+        display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        if best_box is not None and mode_flag == 1:
+            x1, y1, x2, y2 = [int(v) for v in best_box.xyxy[0].tolist()]
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(display,
+                f"{best_conf:.2f} | {ground_dist_m:.2f}m | {bearing_mrad:+d}mrad",
+                (x1, max(y1 - 8, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        else:
+            cv2.putText(display, "SEARCHING", (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        _, jpg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        with frame_lock:
+            latest_frame_jpg = jpg.tobytes()
+
+        packet = build_packet(bearing_mrad, ground_dist_m, mode_flag)
+        uart.write(packet)
+
+        if loop_count % 10 == 0:
+            if mode_flag == 1:
+                print(f"[{loop_count:06d}] TRACKING  - "
+                      f"bearing={bearing_mrad:+5d}mrad, "
+                      f"dist={ground_dist_m:.3f}m, conf={best_conf:.2f}")
+            else:
+                print(f"[{loop_count:06d}] SEARCHING - no ball detected")
+
+        loop_count += 1
+        elapsed    = time.monotonic() - loop_start
+        sleep_time = period - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+END OF COMPLETE CODE AND IMPLEMENTATION REFERENCE
+Last updated: 11 July 2026
+================================================================================

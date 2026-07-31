@@ -1,0 +1,33 @@
+# Arduino build artifacts
+*.bin
+*.elf
+*.hex
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# MATLAB
+*.asv
+*.m~
+slprj/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
+
+# Model weights (too large for Git)
+*.pt
+*.bin
+best_ncnn_model/
+
+# Logs
+*.log

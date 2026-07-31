@@ -1,0 +1,200 @@
+================================================================================
+MCTR 474 - COMPLETE PINOUT AND ELECTRICAL WIRING REFERENCE
+Semi-Autonomous Macadamia Nut Harvesting Robot
+Nunro Brenkman 37540505 - NWU Potchefstroom
+Last updated: 10 July 2026
+================================================================================
+
+
+--------------------------------------------------------------------------------
+POWER ARCHITECTURE SUMMARY
+--------------------------------------------------------------------------------
+
+Battery input:  2x Ingco 20V 4Ah Li-Ion in parallel = 20V nominal, 8Ah
+                (built-in BMS, no external BMS required)
+
+RAIL 1 - 12V Motor Rail
+  Source:  BUCK-300W-20A adjustable buck, input from battery, output set to 12V
+  Fuse:    20A blade fuse between battery and buck input
+  Feeds:   BTS7960 Left (B+ and B-)
+           BTS7960 Right (B+ and B-)
+           BTS7960 Sweeper (B+ and B-)
+  Decoupling: 470uF 25V electrolytic across VCC and GND on each BTS7960 module
+
+RAIL 2 - 5V Pi Rail
+  Source:  Waveshare UPS HAT (B) mounted on Pi 5 GPIO header
+           Powered by 2x Samsung 30Q 18650 cells in the HAT
+           Charged via 8.4V 2A charger into HAT charging port
+  Feeds:   Raspberry Pi 5 directly via GPIO header (no USB-C involved)
+  Note:    Pi is completely independent of the Ingco battery system
+
+RAIL 3 - 5V ESP32 Rail
+  Source:  Fixed 5V 10A buck (WG-1224-S0510), input from battery, output 5V
+  Fuse:    5A blade fuse between battery and buck input
+  Feeds:   ESP32 VIN pin
+           GREEN LED via 330 ohm resistor
+           YELLOW LED via 330 ohm resistor
+           RED LED via 330 ohm resistor
+
+Star ground: all rail GND, battery negative, ESP32 GND, and Pi GND
+  tied together at a single star ground point.
+  Pi GND also wired directly to ESP32 GND as UART common reference.
+
+
+--------------------------------------------------------------------------------
+ESP32 DEVKIT V1 (DOIT, 30-PIN) - COMPLETE PIN ASSIGNMENTS
+--------------------------------------------------------------------------------
+
+Board manager: "esp32_bluepad32 DOIT ESP32 DEVKIT V1"
+Power input:   VIN pin from fixed 5V 10A buck Rail 3
+
+GPIO  | Function           | Connects To                        | Direction
+------|--------------------|-------------------------------------|----------
+4     | LEFT_RPWM          | BTS7960 Left -> R_PWM               | OUT PWM
+      | Left motor forward | LEDC Channel 0, 20kHz, 8-bit        |
+25    | LEFT_LPWM          | BTS7960 Left -> L_PWM               | OUT PWM
+      | Left motor reverse | LEDC Channel 1, 20kHz, 8-bit        |
+27    | RIGHT_RPWM         | BTS7960 Right -> R_PWM              | OUT PWM
+      | Right motor forward| LEDC Channel 2, 20kHz, 8-bit        |
+26    | RIGHT_LPWM         | BTS7960 Right -> L_PWM              | OUT PWM
+      | Right motor reverse| LEDC Channel 3, 20kHz, 8-bit        |
+19    | SWEEPER_RPWM       | BTS7960 Sweeper -> R_PWM            | OUT PWM
+      | Sweeper forward    | LEDC Channel 4, 20kHz, 8-bit        |
+23    | SWEEPER_LPWM       | BTS7960 Sweeper -> L_PWM            | OUT PWM
+      | Sweeper reverse    | LEDC Channel 5, 20kHz, 8-bit        |
+16    | UART2 RX2          | Pi physical pin 8 (GPIO14, TX)      | IN
+17    | UART2 TX2          | Pi physical pin 10 (GPIO15, RX)     | OUT
+21    | GREEN LED          | 330R -> Green LED -> GND            | OUT
+22    | YELLOW LED         | 330R -> Yellow LED -> GND           | OUT
+33    | RED LED            | 330R -> Red LED -> GND              | OUT
+GND   | Common ground      | Star ground point + Pi GND          | POWER
+VIN   | 5V input           | Fixed 5V 10A buck Rail 3            | POWER
+
+DO NOT USE:
+  GPIO0, GPIO1, GPIO3   Boot strapping and USB programming pins
+  GPIO6 to GPIO11       Internal SPI flash, physically unusable
+  GPIO2, GPIO12,        Strapping or boot-affected pins, all avoided
+  GPIO14, GPIO15
+
+
+--------------------------------------------------------------------------------
+RASPBERRY PI 5 - RELEVANT PINS ONLY
+--------------------------------------------------------------------------------
+
+Power:          Waveshare UPS HAT mounted directly on 40-pin GPIO header
+                Pins 2 and 4 (5V) and pins 6, 9, 14, 20, 25, 30, 34, 39 (GND)
+                are used internally by the HAT, do not connect anything else here
+
+Physical Pin 8  | GPIO14 | UART0 TXD | -> ESP32 GPIO16 (RX2)
+Physical Pin 10 | GPIO15 | UART0 RXD | -> ESP32 GPIO17 (TX2)
+Physical Pin 6  | GND    |           | -> ESP32 GND (UART common reference)
+CSI port        | Camera | ribbon    | Pi Camera Module 3 Wide
+
+
+--------------------------------------------------------------------------------
+BTS7960 H-BRIDGE WIRING (all 3 modules, identical connections)
+--------------------------------------------------------------------------------
+
+BTS7960 Pin | Connects To                     | Notes
+------------|---------------------------------|-------------------------------
+R_PWM       | ESP32 RPWM pin for this motor   | Forward speed, duty 0-255
+L_PWM       | ESP32 LPWM pin for this motor   | Reverse speed, duty 0-255
+R_EN        | Module VCC (tied HIGH)          | Hardwired, no ESP32 pin needed
+L_EN        | Module VCC (tied HIGH)          | Hardwired, no ESP32 pin needed
+VCC         | 5V from Rail 3                  | Logic supply
+GND         | Star ground point               | Common ground
+B+          | 12V Motor Rail (Rail 1)         | Motor power supply positive
+B-          | Star ground point               | Motor power supply negative
+M+          | Motor terminal A                | Either motor wire
+M-          | Motor terminal B                | Other motor wire
+R_IS        | Not connected (leave floating)  | Current sense, not used
+L_IS        | Not connected (leave floating)  | Current sense, not used
+
+MODULE ASSIGNMENTS:
+  BTS7960 Left:    GPIO4 (R_PWM), GPIO25 (L_PWM) -> Left drive motor
+  BTS7960 Right:   GPIO27 (R_PWM), GPIO26 (L_PWM) -> Right drive motor
+  BTS7960 Sweeper: GPIO19 (R_PWM), GPIO23 (L_PWM) -> Sweeper brush motor
+
+
+--------------------------------------------------------------------------------
+STATUS LEDS
+--------------------------------------------------------------------------------
+
+Each LED wired in series with a 330 ohm resistor between the ESP32 GPIO
+pin and GND. ESP32 GPIO drives HIGH to illuminate, LOW to extinguish.
+
+Colour  | GPIO | Meaning
+--------|------|----------------------------------
+Green   | 21   | Manual mode active
+Yellow  | 22   | Autonomous mode active
+Red     | 33   | Fault or e-stop active (boot default)
+
+
+--------------------------------------------------------------------------------
+UART WIRING (ESP32 <-> Raspberry Pi)
+--------------------------------------------------------------------------------
+
+Use Dupont jumper wires. Keep under 300mm. No level shifter needed,
+both devices operate at 3.3V logic.
+
+ESP32 GPIO16 (RX2) <- Pi physical pin 8  (GPIO14, UART0 TX)
+ESP32 GPIO17 (TX2) -> Pi physical pin 10 (GPIO15, UART0 RX)
+ESP32 GND          -- Pi physical pin 6  (GND)
+
+Packet: 8 bytes at 115200 baud, 10Hz, big-endian
+  Bytes 0-1: bearing_error  (int16, milliradians)
+  Bytes 2-5: ground_distance (float32, metres)
+  Byte  6:   mode_flag      (uint8, 0=no target, 1=target detected)
+  Byte  7:   checksum       (uint8, XOR of bytes 0-6)
+
+
+--------------------------------------------------------------------------------
+CAMERA MODULE
+--------------------------------------------------------------------------------
+
+Module:         Raspberry Pi Camera Module 3 Wide
+Connection:     CSI ribbon cable to Pi 5 CSI port
+Mounting:       220mm above ground, 25 degrees depression below horizontal
+                10mm rearward offset from robot front face
+                Fixed mount, mechanically locked, no adjustable angle
+Focus:          Fixed at 0.8m (AfMode=0, LensPosition=1.25 dioptres)
+                Autofocus disabled to prevent blur during robot motion
+Stream:         MJPEG on port 8080
+                Home WiFi: http://192.168.0.29:8080/stream
+                Pi hotspot: http://10.42.0.1:8080/stream
+
+
+--------------------------------------------------------------------------------
+WIRE GAUGE GUIDE
+--------------------------------------------------------------------------------
+
+18AWG:  Battery to master switch, battery to buck converters,
+        buck converter outputs to BTS7960 B+ terminals,
+        BTS7960 M+ and M- to motors
+24AWG:  BTS7960 VCC and GND logic supply lines,
+        Buck converter GND to star ground
+Dupont: All signal wires (PWM, UART, LED signals)
+        Never carry motor current through Dupont wires
+
+
+--------------------------------------------------------------------------------
+DONT USE / WARNINGS
+--------------------------------------------------------------------------------
+
+Never drive R_PWM and L_PWM on the same BTS7960 simultaneously.
+  This causes shoot-through and will destroy the module.
+  Firmware enforces exclusive activation via driveMotor().
+
+Never power the Pi via USB-C and the UPS HAT simultaneously.
+  Use only one power source at a time.
+
+Never switch the UPS HAT power switch off while the Pi is running.
+  Always run: sudo shutdown now, wait for LED to stop, then switch off.
+
+Always turn the UPS HAT switch to OFF before inserting or removing
+  the 18650 batteries.
+
+================================================================================
+End of pinout and wiring reference.
+Last updated: 10 July 2026
+================================================================================

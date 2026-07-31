@@ -1,0 +1,114 @@
+================================================================================
+MCTR 474 - VISION PIPELINE CALIBRATION PLANNING REFERENCE
+Nunro Brenkman 37540505 - NWU Potchefstroom
+================================================================================
+
+SUMMARY: Distance readings from the vision pipeline are currently indicative
+only. Bearing (left/right angle) is reliable now. Distance accuracy requires
+physical calibration once the robot is assembled.
+
+
+--------------------------------------------------------------------------------
+PLACEHOLDERS REQUIRING CALIBRATION
+--------------------------------------------------------------------------------
+
+1. FOCAL_LENGTH_PX = 259.1                              CRITICAL
+   What it is: estimated from Camera Module 3 Wide spec sheet, not measured.
+   Effect: every distance reading scales linearly with this value.
+           A 10% error here means every distance is wrong by 10%.
+   Fix: OpenCV chessboard calibration (see sequence below).
+   Where in code: harvest_vision.py, line near top of configuration section.
+
+2. CAMERA_HEIGHT_MM = 220.0                             MEDIUM
+   What it is: design value from CAD, not physically measured.
+   Effect: affects all ground distance calculations, especially at close range.
+   Fix: measure actual lens centre height above ground with tape measure
+        after camera bracket is mounted and bolted to chassis.
+   Where in code: harvest_vision.py, configuration section.
+
+3. DEPRESSION_DEG = 25.0                                MEDIUM
+   What it is: design angle from specification, not physically verified.
+   Effect: affects ground distance projection geometry.
+   Fix: measure actual angle with a digital level or protractor once the
+        3D printed camera mount is installed. Manufacturing tolerances can
+        introduce 1-2 degrees of error.
+   Where in code: harvest_vision.py, configuration section.
+
+4. CONFIDENCE_THRESHOLD = 0.5                           FIELD TUNE
+   What it is: minimum YOLO detection confidence to count as a valid ball.
+   Effect: too high causes missed detections, too low causes false positives.
+   Fix: test in actual outdoor lighting conditions on real macadamia nuts.
+        Lower to 0.4 if too many misses. Raise to 0.6 if false triggers occur.
+   Where in code: harvest_vision.py, configuration section.
+
+5. CAP_DIST = 0.15m  (in ESP32 firmware: CAP_DIST = 0.15)  FIELD TUNE
+   What it is: estimated distance at which ball disappears below camera FOV.
+   Effect: triggers the Zone 3 blind capture drive too early or too late.
+   Fix: place a ball in front of the mounted camera and physically move it
+        toward the robot until it disappears from the bottom of the stream.
+        Measure that distance from the robot front face. Use it as CAP_DIST.
+   Where in code: harvest_vision.py and main_controller.ino.
+
+6. CAMERA_OFFSET_MM = 10.0                              LOW PRIORITY
+   What it is: rearward offset of lens from robot front face.
+   Effect: currently not used in any active calculation. Documented only.
+   Fix: no immediate action needed.
+
+
+--------------------------------------------------------------------------------
+CALIBRATION SEQUENCE (DO IN THIS ORDER AFTER ROBOT IS ASSEMBLED)
+--------------------------------------------------------------------------------
+
+Step 1: Physical measurements
+   - Mount camera bracket, tighten all bolts
+   - Measure actual lens centre height above flat ground (target: 220mm)
+   - Measure actual depression angle with digital level (target: 25 degrees)
+   - Update CAMERA_HEIGHT_MM and DEPRESSION_DEG in harvest_vision.py
+
+Step 2: OpenCV chessboard calibration (replaces FOCAL_LENGTH_PX)
+   - Print a standard OpenCV chessboard (9x6 inner corners, 25mm squares)
+   - With camera mounted at final position, photograph the board from at
+     least 20 different angles and distances
+   - Run OpenCV calibrateCamera() to obtain the 3x3 camera matrix
+   - Extract fx (top-left element of matrix, units: pixels)
+   - Update FOCAL_LENGTH_PX = fx in harvest_vision.py
+   - This is approximately a half-day task
+
+Step 3: Distance validation
+   - Place a golf ball at exactly 500mm from the robot front face
+   - Check pipeline distance reading vs tape measure
+   - Repeat at 1000mm and 1500mm
+   - All readings should agree within 50mm at these distances
+   - If not, recheck CAMERA_HEIGHT_MM and DEPRESSION_DEG measurements
+
+Step 4: Capture zone threshold
+   - With camera running, place ball directly in front of robot
+   - Slowly move ball toward robot until it disappears from stream bottom edge
+   - Measure distance from robot front face at that point
+   - Update CAP_DIST in harvest_vision.py and CAP_DIST in main_controller.ino
+
+Step 5: Confidence threshold
+   - Test in actual outdoor lighting on real macadamia nuts
+   - Observe detection rate and false positive rate
+   - Adjust CONFIDENCE_THRESHOLD up or down as needed
+
+
+--------------------------------------------------------------------------------
+WHAT IS RELIABLE NOW (NO CALIBRATION NEEDED)
+--------------------------------------------------------------------------------
+
+- Bearing error (left/right angle in milliradians): reliable now.
+  The bearing calculation uses only pixel_x offset from frame centre divided
+  by focal length. Small focal length errors affect this far less than distance.
+
+- Detection itself (is a ball visible or not): reliable now.
+  YOLO confidence and class prediction do not depend on geometric calibration.
+
+- UART communication and ESP32 steering response: working and validated.
+
+- Zone transitions and state machine logic: working and validated.
+
+
+================================================================================
+END OF CALIBRATION PLANNING REFERENCE
+================================================================================

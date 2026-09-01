@@ -56,8 +56,10 @@ const int LED_YELLOW_PIN = 22;  // autonomous mode active, was GPIO15 (strapping
 const int LED_RED_PIN    = 33;  // fault / e-stop,         unchanged
 
 // --- Sweeper ramp parameters, non-blocking (no delay()), updated once per loop() ---
-const int SWEEPER_TARGET_PWM = PWM_MAX / 4;  // 25% max speed, ~63/255, tune in field
-const unsigned long SWEEPER_RAMP_MS = 1500;  // 1.5s ramp, both directions
+const int SWEEPER_START_PWM  = PWM_MAX / 4;  // 25% initial speed on turn-on (63/255)
+const int SWEEPER_MIN_PWM    = PWM_MAX / 10;  // 10% start speed  ( 25/255)
+const int SWEEPER_TARGET_PWM = PWM_MAX / 2;   // 50% target speed (127/255)
+const unsigned long SWEEPER_RAMP_MS = 1500;   // 1.5s ramp from 10% to 50%
 
 // --- Software trim for straight-line drift correction ---
 // Both set to 0 until empirical field testing determines the offset needed.
@@ -84,9 +86,11 @@ int g_leftPWM = 0, g_rightPWM = 0;
 // Big-endian byte order throughout. Transmitted at 10Hz from Pi vision pipeline.
 const int   UART_PACKET_SIZE      = 8;    // 7 payload bytes + 1 checksum
 const float AUTONOMOUS_KP         = 0.5;   // proportional gain, tune empirically in field
-const int   AUTONOMOUS_SPEED      = 102;   // 40% PWM, adjusted from 30% after field observation
-const int   AUTO_MAX_PWM          = 102;   // hard cap on ALL autonomous motor outputs, 40% PWM
-const int   CAPTURE_SPEED         = 102;   // capture drive also capped at 40% PWM
+const int   AUTONOMOUS_SPEED      = 191;   // 75% PWM approach/capture/search speed
+const int   AUTO_MAX_PWM          = 191;   // hard cap on ALL autonomous motor outputs, 75% PWM
+const int   CAPTURE_SPEED         = 191;   // 75% PWM capture drive
+const int   TURN_RAMP_START_PWM   = 128;   // 50% turn authority at approach entry
+const unsigned long TURN_RAMP_MS  = 1500;  // 1.5s ramp to full 75% turn authority
 const unsigned long UART_TIMEOUT_MS    = 2000;
 const unsigned long CAPTURE_DRIVE_MS  = 1200;
 const unsigned long SEARCH_TIMEOUT_MS = 10000;
@@ -102,6 +106,8 @@ unsigned long g_lastDetectionMs   = 0;  // last time mode_flag=1 was received
 // Capture zone state
 bool          g_captureDriving  = false;
 unsigned long g_captureStartMs  = 0;
+bool          g_inApproach      = false;   // true while Zone 2 is active
+unsigned long g_approachEntryMs = 0;       // timestamp when Zone 2 last started
 
 // Forward declaration, needed because onDisconnectedController() (below) calls this
 // before its full definition appears later in the file
@@ -356,7 +362,8 @@ void runAutonomousSteering() {
     // ignored and the robot holds its last approach trajectory.
     if (now - g_lastValidPacketMs > UART_TIMEOUT_MS ||
        (g_modeFlag == 0 && now - g_lastDetectionMs > DETECTION_DROPOUT_MS)) {
-        int searchSpeed = constrain(75, 0, AUTO_MAX_PWM);
+        g_inApproach = false;  // Reset approach flag so turn ramp restarts on next approach
+        int searchSpeed = AUTO_MAX_PWM;  // 75% PWM pivot speed
         driveMotor(LEFT_RPWM_CHANNEL,  LEFT_LPWM_CHANNEL,   searchSpeed + LEFT_TRIM);
         driveMotor(RIGHT_RPWM_CHANNEL, RIGHT_LPWM_CHANNEL, -searchSpeed + RIGHT_TRIM);
         g_leftPWM  =  searchSpeed;
@@ -376,8 +383,25 @@ void runAutonomousSteering() {
         return;
     }
 
+    // Mark approach entry and start turn ramp from 50% to 75% over 1.5s.
+    // Ramp resets each time the robot transitions from search into approach,
+    // preventing jerky full-authority turns on initial target acquisition.
+    if (!g_inApproach) {
+        g_inApproach      = true;
+        g_approachEntryMs = now;
+    }
+    unsigned long approachElapsed = now - g_approachEntryMs;
+    int turnCap;
+    if (approachElapsed >= TURN_RAMP_MS) {
+        turnCap = AUTO_MAX_PWM;  // 75% full turn authority
+    } else {
+        turnCap = TURN_RAMP_START_PWM +
+            (int)((long)(AUTO_MAX_PWM - TURN_RAMP_START_PWM)
+                  * (long)approachElapsed / (long)TURN_RAMP_MS);
+    }
+
     int turnOffset = (int)(AUTONOMOUS_KP * (float)g_bearingMrad / 10.0f);
-    turnOffset = clampToMax(turnOffset, AUTO_MAX_PWM);
+    turnOffset = clampToMax(turnOffset, turnCap);
 
     int leftSpeed  = constrain(AUTONOMOUS_SPEED + turnOffset + LEFT_TRIM,  -AUTO_MAX_PWM, AUTO_MAX_PWM);
     int rightSpeed = constrain(AUTONOMOUS_SPEED - turnOffset + RIGHT_TRIM, -AUTO_MAX_PWM, AUTO_MAX_PWM);
@@ -418,8 +442,9 @@ void processGamepad(ControllerPtr ctl) {
             // Auto-start sweeper when entering autonomous mode
             if (!sweeperRunning) {
                 sweeperRunning = true;
-                setSweeperTarget(SWEEPER_TARGET_PWM);
-                Serial.println("Autonomous mode: sweeper auto-started");
+                g_sweeperPWM = SWEEPER_MIN_PWM;        // snap to 10% immediately
+                setSweeperTarget(SWEEPER_TARGET_PWM);  // ramp to 50% over 1.5s
+                Serial.println("Autonomous: sweeper auto-started (10% -> 50% over 1.5s)");
             }
             g_lastDetectionMs = millis();  // reset search timeout on mode entry
         }
@@ -433,7 +458,12 @@ void processGamepad(ControllerPtr ctl) {
     if (crossNow && !crossPrev && !eStopActive) {
         sweeperRunning = !sweeperRunning;
         Serial.printf("Sweeper: %s (ramping)\n", sweeperRunning ? "ON" : "OFF");
-        setSweeperTarget(sweeperRunning ? SWEEPER_TARGET_PWM : 0);
+        if (sweeperRunning) {
+            g_sweeperPWM = SWEEPER_MIN_PWM;        // snap to 10% immediately
+            setSweeperTarget(SWEEPER_TARGET_PWM);  // ramp to 50% over 1.5s
+        } else {
+            setSweeperTarget(0);  // ramp down from current to 0 over 1.5s
+        }
     }
     crossPrev = crossNow;
 

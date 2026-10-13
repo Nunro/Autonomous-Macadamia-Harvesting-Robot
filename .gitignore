@@ -31,3 +31,8 @@ best_ncnn_model/
 
 # Logs
 *.log
+
+# Vision training: never commit image data
+vision_training/**/*.jpg
+vision_training/**/*.jpeg
+vision_training/**/*.png

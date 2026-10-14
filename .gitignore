@@ -36,3 +36,9 @@ best_ncnn_model/
 vision_training/**/*.jpg
 vision_training/**/*.jpeg
 vision_training/**/*.png
+
+# Vision results: allow plots, block model exports and caches
+!vision_training/results/**/*.png
+!vision_training/results/**/*.jpg
+*_ncnn_model/
+*.cache

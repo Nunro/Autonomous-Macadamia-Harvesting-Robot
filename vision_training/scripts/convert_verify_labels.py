@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw
 # CONFIGURATION
 # ------------------------------------------------------------------------------
 PROJECT_DIR = Path(r"C:\MCTR474_Vision")
-EXPORT_FILE = "test_export_20.json"
+EXPORT_FILE = "full_export_v1.json"
 CLASSES = ["golf_ball"]                 # class id 0
 TRAIN_IMGSZ = 640                       # YOLO training size, used to predict box size in training
 

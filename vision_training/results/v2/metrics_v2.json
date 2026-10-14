@@ -1,0 +1,70 @@
+{
+  "model": "YOLOv8n (COCO-pretrained, transfer learning)",
+  "ultralytics_version": "8.4.177",
+  "dataset": {
+    "train": 1005,
+    "val": 73,
+    "test": 70,
+    "note": "335 original train images + 670 augmented copies; val/test unaugmented"
+  },
+  "settings": {
+    "imgsz": 640,
+    "epochs_max": 150,
+    "patience": 30,
+    "batch": 16,
+    "seed": 474,
+    "class_names": [
+      "golf-ball"
+    ]
+  },
+  "epochs_run": 146,
+  "best_epoch": 116,
+  "metrics": {
+    "validation": {
+      "precision": 0.9962,
+      "recall": 0.9918,
+      "mAP50": 0.9948,
+      "mAP50_95": 0.9311
+    },
+    "test": {
+      "precision": 0.9903,
+      "recall": 1.0,
+      "mAP50": 0.995,
+      "mAP50_95": 0.9408
+    }
+  },
+  "test_at_deploy_conf": {
+    "conf": 0.5,
+    "true_positives": 231,
+    "false_positives": 1,
+    "missed": 0,
+    "precision": 0.9957,
+    "recall": 1.0
+  },
+  "test_recall_by_size": [
+    {
+      "size": "<10 px",
+      "balls": 26,
+      "found": 26,
+      "recall": 1.0
+    },
+    {
+      "size": "10-20 px",
+      "balls": 55,
+      "found": 55,
+      "recall": 1.0
+    },
+    {
+      "size": "20-40 px",
+      "balls": 65,
+      "found": 65,
+      "recall": 1.0
+    },
+    {
+      "size": ">40 px",
+      "balls": 85,
+      "found": 85,
+      "recall": 1.0
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+# Write one TEST image name per line (e.g. dataset_0029.jpg) for every test image
+# that shows THE SAME SCENE as one of its training partners on the sheets:
+# same balls in the same places on the same ground, regardless of small camera
+# movement or which way the balls are turned. Lines starting with # are ignored.
+dataset_0015.jpg
+dataset_0016.jpg
+dataset_0018.jpg
+dataset_0065.jpg
+dataset_0115.jpg
+dataset_0131.jpg
+dataset_0148.jpg
+dataset_0165.jpg
+dataset_0199.jpg
+dataset_0201.jpg
+dataset_0223.jpg
+dataset_0238.jpg
+dataset_0244.jpg
+dataset_0259.jpg
+dataset_0264.jpg
+dataset_0362.jpg

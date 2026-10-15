@@ -31,9 +31,9 @@ MODEL_PATH           = "/home/nunro/harvest/models/v2/best_v2_ncnn_model"   # v2
 INFERENCE_WIDTH      = 640
 INFERENCE_HEIGHT     = 480
 CAMERA_HEIGHT_MM     = 220.0
-DEPRESSION_DEG       = 25.0
+DEPRESSION_DEG       = 18.97   # EFFECTIVE angle from the same fit, pairs with CAMERA_HEIGHT_MM = 220
 CAMERA_OFFSET_MM     = 10.0
-FOCAL_LENGTH_PX      = 259.1   # placeholder, replace with calibrated value
+FOCAL_LENGTH_PX      = 474.2   # calibrated 2026-10-15, in-situ fit, 7 points 0.26-1.51 m, RMS 0.18 deg
 PACKET_RATE_HZ       = 10
 CONFIDENCE_THRESHOLD = 0.5
 SPORTS_BALL_CLASS_ID = 0

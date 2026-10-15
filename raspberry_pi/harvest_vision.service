@@ -1,0 +1,18 @@
+[Unit]
+Description=MCTR 474 Macadamia Harvesting Vision Pipeline
+After=multi-user.target
+
+[Service]
+Type=simple
+User=nunro
+WorkingDirectory=/home/nunro/harvest
+Environment=PYTHONPATH=/home/nunro/.local/lib/python3.13/site-packages
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/nunro/harvest/harvest_vision.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

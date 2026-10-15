@@ -84,8 +84,29 @@ int g_leftPWM = 0, g_rightPWM = 0;
 // --- UART packet from Pi ---
 // 8-byte structure: [bearing_error: int16][ground_distance: float32][mode_flag: uint8][checksum: uint8]
 // Big-endian byte order throughout. Transmitted at 10Hz from Pi vision pipeline.
+// ============================================================================
+// CAMERA CALIBRATION UPDATE - 15 October 2026
+// The Pi vision pipeline was calibrated in-situ. Two constants changed:
+//   FOCAL_LENGTH_PX: 259.1 (spec-sheet placeholder) -> 474.2 (calibrated)
+//   DEPRESSION_DEG:  25.0  (design value)            -> 18.97 (effective)
+// Consequences for the ESP32:
+//   1. Bearing values are now 259.1/474.2 = 54.7% of their previous magnitude
+//      for the same physical angle. AUTONOMOUS_KP updated accordingly (below).
+//   2. Distance values were off by up to 53% before calibration. All distance
+//      thresholds in this file have been reviewed and updated where needed.
+//   3. CAP_DIST changed from 0.15m to 0.25m (see comment at the trigger point).
+//   4. CAPTURE_DRIVE_MS and other timing constants need field re-tuning.
+//   5. Detection range limit is 1.5m from the robot front face (Pi camera
+//      loses the ball at approximately 11-12 px width in the frame).
+// ============================================================================
 const int   UART_PACKET_SIZE      = 8;    // 7 payload bytes + 1 checksum
-const float AUTONOMOUS_KP         = 0.5;   // proportional gain, tune empirically in field
+// KP updated 15 Oct 2026 after camera calibration. Focal length corrected from
+// 259.1 px (placeholder) to 474.2 px (calibrated). Bearing values sent by the Pi
+// are now 259.1/474.2 = 54.7% of their previous magnitude for the same physical
+// angle. KP scaled up by the inverse ratio (474.2/259.1 = 1.829) to maintain the
+// same steering authority: 0.5 * 1.829 = 0.914, rounded to 0.9 as a safe field
+// starting point. Re-tune empirically once the robot drives on grass.
+const float AUTONOMOUS_KP         = 0.9;   // updated after focal length calibration, field tune
 const int   AUTONOMOUS_SPEED      = 191;   // 75% PWM approach/capture/search speed
 const int   AUTO_MAX_PWM          = 191;   // hard cap on ALL autonomous motor outputs, 75% PWM
 const int   CAPTURE_SPEED         = 191;   // 75% PWM capture drive
@@ -298,22 +319,34 @@ MotorOutput computeSkidSteer(int throttleRaw, int turnRaw) {
 // ============================================================================
 
 bool parseUartPacket() {
+    // Self-resyncing parser (updated 15 Oct 2026).
+    // On a checksum failure the buffer shifts left by one byte (memmove) and
+    // the parser retries on the next call with one fresh byte appended. The
+    // parser recovers within at most 8 calls after a startup misalignment,
+    // without requiring an ESP32 reset. Serial spam is suppressed: only the
+    // first mismatch in a resync sequence prints; subsequent shifts are silent.
     static uint8_t buf[UART_PACKET_SIZE];
     static int     bytesRead = 0;
+    static bool    resyncing = false;
 
     while (Serial2.available() > 0 && bytesRead < UART_PACKET_SIZE) {
         buf[bytesRead++] = Serial2.read();
     }
-
     if (bytesRead < UART_PACKET_SIZE) return false;
-    bytesRead = 0;
 
     uint8_t checksum = 0;
     for (int i = 0; i < 7; i++) checksum ^= buf[i];
     if (checksum != buf[7]) {
-        Serial.println("UART: checksum mismatch, packet discarded");
+        if (!resyncing) {
+            Serial.println("UART: checksum mismatch, resyncing...");
+            resyncing = true;
+        }
+        memmove(buf, buf + 1, UART_PACKET_SIZE - 1);  // shift left, drop oldest byte
+        bytesRead = UART_PACKET_SIZE - 1;               // need one more byte next call
         return false;
     }
+    resyncing = false;
+    bytesRead = 0;
 
     g_bearingMrad = (int16_t)((buf[0] << 8) | buf[1]);
 
@@ -375,7 +408,13 @@ void runAutonomousSteering() {
     // Note: g_lastDetectionMs is updated in parseUartPacket() when flag=1.
     // Do NOT update it here or the dropout timer never accumulates.
 
-    if (g_groundDistM > 0.0f && g_groundDistM < 0.15f) {
+    // CAP_DIST updated 15 Oct 2026 after camera calibration. The camera physically
+    // loses the ball at approximately 0.204m from the robot front face (ball centre
+    // at the bottom image edge). The old threshold of 0.15m could never be reached
+    // by vision: the robot would drop to SEARCHING before triggering capture.
+    // 0.25m leaves approximately 35mm margin above the blind spot. Verify on grass
+    // that the stream still shows TRACKING as the robot closes to 0.25m.
+    if (g_groundDistM > 0.0f && g_groundDistM < 0.25f) {
         Serial.printf("CAPTURE triggered at %.3fm, driving forward %dms\n",
                       g_groundDistM, CAPTURE_DRIVE_MS);
         g_captureDriving = true;
